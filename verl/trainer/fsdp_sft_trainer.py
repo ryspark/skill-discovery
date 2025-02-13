@@ -27,6 +27,7 @@ import logging
 import re
 import torch
 import torch.distributed
+from math import ceil
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, AutoConfig
@@ -202,18 +203,27 @@ class FSDPSFTTrainer(object):
         log_gpu_memory_usage('After initialize optimizer', logger=logger)
 
         steps_per_epoch = len(self.train_dataloader)
-        total_steps = steps_per_epoch * self.config.trainer.total_epochs
+        if self.config.trainer.total_epochs is not None and self.config.trainer.total_steps is not None:
+            raise ValueError("At most one of trainer.total_epochs, trainer.total_steps can be non-null")
+        if self.config.trainer.total_epochs is not None:
+            self.total_steps = steps_per_epoch * self.config.trainer.total_epochs
+            self.total_epochs = self.config.trainer.total_epochs
+        else:
+            self.total_steps = self.config.trainer.total_steps
+            if self.total_steps is None:
+                raise ValueError("Must specify trainer.total_steps if trainer.total_epochs is null")
+            self.total_epochs = ceil(self.total_steps / steps_per_epoch)
 
         if self.device_mesh.get_rank() == 0:
             print(
-                f'Number of steps/epoch {steps_per_epoch}, number of epochs {self.config.trainer.total_epochs}, total number of steps {total_steps}'
+                f'Number of steps/epoch {steps_per_epoch}, number of epochs {self.total_epochs}, total number of steps {self.total_steps}'
             )
 
-        num_warmup_steps = int(total_steps * self.config.optim.warmup_steps_ratio)
+        num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
 
         self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer,
                                                             num_warmup_steps=num_warmup_steps,
-                                                            num_training_steps=total_steps)
+                                                            num_training_steps=self.total_steps)
 
     def _compute_loss(self, batch):
         loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
@@ -303,6 +313,7 @@ class FSDPSFTTrainer(object):
         # save huggingface model
         if self.device_mesh.get_rank() == 0:
             os.makedirs(path, exist_ok=True)
+            print(f"Saving model to {path}")
             self.model.save_pretrained(path, state_dict=state_dict)
             self.tokenizer.save_pretrained(path)
             if self.config.trainer.default_hdfs_dir:
@@ -322,8 +333,8 @@ class FSDPSFTTrainer(object):
         global_step = 0
 
         # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
-
-        for epoch in range(self.config.trainer.total_epochs):
+        done = False
+        for epoch in range(self.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
             for data in self.train_dataloader:
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
@@ -331,6 +342,9 @@ class FSDPSFTTrainer(object):
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
                 global_step += 1
+                if global_step >= self.total_steps:
+                    done = True
+                    break
 
             # validation
             val_losses = []
@@ -346,6 +360,8 @@ class FSDPSFTTrainer(object):
 
             # save checkpoint
             self.save_checkpoint(step=global_step)
+            if done:
+                break
 
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
