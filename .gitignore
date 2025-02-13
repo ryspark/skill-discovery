@@ -2,6 +2,10 @@ samples
 models
 data
 core
+outputs
+slurm
+wandb
+cache
 
 **/*.pt
 **/checkpoints
