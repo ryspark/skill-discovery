@@ -31,14 +31,14 @@ def score(f, desc=None, cache_dir=None):
     with open(f, "r") as fi:
         samples = json.load(fi)
     results = []
-    for q, out in tqdm(samples.items(), desc=desc, disable=desc is None): 
+    for q, out in tqdm(samples.items(), desc=desc, disable=desc is None):
         try:
             correct = verify(parse(out["true"]), parse(out["sampled"]))
         except:
             correct = False
         results.append(correct)
     results = np.array(results)
-    
+
     if cache_dir is not None:
         np.savez_compressed(cache_path, results=results)
     return results
@@ -48,7 +48,14 @@ def frozendict(d):
     return tuple(sorted(d.items()))
 
 
-def parse_filename(s):
+def model_slice(excluded=None, synthetic=None):
+    return frozendict({
+        "excluded": tuple(excluded or []),
+        "synthetic": tuple(synthetic or [])
+    })
+
+
+def parse_filename(s, include_version=False):
     parts = s.split("__")
     excluded_subject = parts[1]
     synthetic_subject = parts[3]
@@ -57,19 +64,21 @@ def parse_filename(s):
 
     def map_tags(tag):
         if tag == "NULL":
-            return None
+            return ()
         if "_" in tag:
-            return [r_subject_tags.get(t, t) for t in tag.split("_")]
-        return r_subject_tags.get(tag, tag)
+            return tuple([r_subject_tags.get(t, t) for t in tag.split("_")])
+        return r_subject_tags.get(tag, tag),
 
-    return frozendict({
+    data = {
         "excluded": map_tags(excluded_subject),
         "synthetic": map_tags(synthetic_subject),
-        "version": version if version != "NULL" else None
-    })
+    }
+    if include_version:
+        data["version"] = version if version != "NULL" else None
+    return frozendict(data)
 
 
-def ci(x, confidence=0.95):
+def ci(x, confidence=0.90):
     m, se = np.mean(x), scipy.stats.sem(x)
     return se * scipy.stats.t.ppf((1 + confidence) / 2., len(x) - 1)
 
@@ -80,4 +89,3 @@ for i, model in enumerate(sorted(os.listdir(sample_dir))):
     info = parse_filename(model)
     desc = f"({i + 1} / {len(os.listdir(sample_dir))})"
     scores = score(path, desc=desc, cache_dir=cache_dir)
-    print(info, ":", scores.mean(), "+/-", ci(scores))
